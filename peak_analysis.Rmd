@@ -1,0 +1,762 @@
+---
+title: "ATAC seq analysis"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+---
+
+# Set up
+
+<details>
+  <summary>Functions</summary>
+This are a few customized functions that will be used during this analysis. 
+```{r warning=FALSE}
+#function to show color palettes
+my_color_pal <- function(colours, names_or_hex, borders = NULL, cex_label = 1, ncol = NULL) {
+
+  # get hexs
+  colours_hex <- unname(colours)
+  # get names
+  names_colours <- names(colours)
+
+  # functions internal to scales::show_col()
+  n <- length(colours)
+  ncol <- ceiling(sqrt(n))
+  nrow <- ceiling(n/ncol)
+
+  colours <- c(colours, rep(NA, nrow * ncol - length(colours)))
+  colours <- matrix(colours, ncol = ncol, byrow = TRUE)
+
+  old <- par(pty = "s", mar = c(0, 0, 0, 0))
+  on.exit(par(old))
+
+  size <- max(dim(colours))
+  plot(c(0, size), c(0, -size), type = "n", xlab = "", ylab = "", axes = FALSE)
+  rect(col(colours) - 1, -row(colours) + 1, col(colours), -row(colours),
+    col = colours, border = borders)
+  # add conditional plotting of hex codes or names
+  if (names_or_hex == "hex") {
+    text(col(colours) - 0.5, -row(colours) + 0.5, colours_hex)
+  } else if(names_or_hex == "names"){
+    text(col(colours) - 0.5, -row(colours) + 0.5, names_colours)
+  } else {
+    text(col(colours) - 0.5, -row(colours) + 0.5, paste0(names_colours,'\n',colours_hex))
+  }
+}
+```
+
+```{r, warning=FALSE}
+#function to rename counts.df to make some graphs
+label_cond <- function(x) { samples.info$condition[x] }
+
+# relabel_id <- function(df, col) {
+#   if (exists("sample.info") && all(samples.info$Sample %in% df$col)) {
+#     matching_row_names <- samples.info$Sample[samples.info$Sample %in% df$col]
+#     df$col[df$col %in% matching_row_names] <- names(samples.info)[matching_row_names]
+#   }
+#   
+#   return(df)
+# }
+
+```
+</details>
+
+
+
+```{r setup, include=FALSE, warning=FALSE}
+# Get your working directory (where you have your data):
+wd <- "/home/mariarossello/atac_laia/peak_analysis_rerun_20230727"
+knitr::opts_knit$set(
+  root.dir = normalizePath(wd))
+
+knitr::opts_chunk$set(
+  warning = FALSE,
+  message = FALSE,
+  echo = TRUE
+  ) 
+```
+
+
+## Data import
+```{r, include=FALSE, warning=FALSE}
+#general libraries
+library(dplyr)
+library(purrr)
+```
+
+Keep in mind that you need a folder called images and another one called stats. In this folder we will save all the results from our analysis. We define them to use them in all of our analysis.
+```{r}
+setwd(file.path(wd))
+imgdir  <- "./images/"
+statdir <- "./stats/"
+```
+
+Load a sample info file with all the information from the ATAC seq. 
+```{r, warning=FALSE}
+library(readr)
+samples.info <- read_delim("./info_embryo.csv",
+                           delim = ";", 
+                           escape_double = FALSE, 
+                           trim_ws = TRUE)
+head(samples.info,2)
+```
+
+We make a matrix with the consensus peaks counts. We have the information speared in different files (one per stage) so we manege them in one matrix.
+```{r}
+# Specify the folder path
+counts_path <- "./counts"
+counts.file <- paste0(counts_path, "/merged_embryos.counts")
+
+counts <- as.matrix(read.csv(counts.file,row.names=1,sep = "\t"))
+str(counts)
+head(counts[,c(1, 2, 3)],2)
+```
+
+We import some peak information (ampliar depsres la taula...)
+
+```{r}
+peaks_width <- read_table("pfla_all_peaks_width.txt",
+                          col_names = c("peak_id", "width"), 
+                          col_types = cols(X2 = col_integer()))
+
+peaks_annot <- read_delim("peaks_to_genes_annotation.tbl",
+                          delim = "\t", 
+                          escape_double = FALSE,
+                          col_names = c("peak_id", "cdip_gene", "uniprot_id", "FBgn_id", "FB_symbol", "FB_name"), 
+                          trim_ws = TRUE)
+
+peaks_info <- merge(peaks_annot, 
+                    peaks_width, 
+                    by.x="peak_id")
+```
+
+
+## Parameters set up
+This group of data can be used to define some variables of your experiment and some aesthetic parameter for your graphs.
+
+Set the statistical parameters for the analysis:
+
+```{r}
+MIN.FC <- 0.5 # Define Fold Change (FC) threshold
+MIN.PV <- 0.05 # Define p-value (PV) threshold
+cat(paste0("The Fold change threshold this analysis is ", MIN.FC, 
+             "\nThe máximum p-value considired sigificative in this analysis is ", MIN.PV))
+```
+
+We establish the comparisons we wish to study. We define our conditions to study as `condition`
+
+```{r}
+condition_factors <- factor(samples.info$stage,
+                            levels=c( "emb4","emb6","emb8","emb10", "emb12", "emb14" ))
+samples.info$condition <- condition_factors
+cat(paste0('Condition: ', levels(condition_factors), '\n'))
+```
+
+Set some color parameters to have coherent graphs:
+
+```{r fig.width=3, fig.height=3}
+# IMPORTANT: The name of your conditions must be the same defined in samples.info
+condition.colors <- c("emb4"="#F4AE3E",
+                      "emb6"="#8EA4D2",
+                      "emb8"="#4A314D",
+                      "emb10"="#F59CA9",
+                      "emb12"="#32936F",
+                      "emb14"="#2B3A67") 
+my_color_pal(colours = condition.colors,
+             names_or_hex = "other", #names=condition hex=color_code other=both
+             borders=NA) 
+```
+# Counts exploration
+
+We explore the counts data without any transformation
+
+```{r, include=FALSE, warning=FALSE}
+#libraries used to perform DESeq2 analysis
+library(ggplot2)
+library(ggrepel)
+library(dendextend)
+```
+
+Initial exploration of the raw data. In this section we will explore if there are some inconsistencies in our war data and it it's necessary to eliminate some replicas. 
+
+We filter the rows with no counts or only 1 count. With this filter we eliminate some useless data and speed up the downstream processes.
+```{r}
+keep <- rowSums(counts) > 2
+counts <- counts[keep,]
+```
+
+```{r}
+#merge of the raw counts with the sample information. We also transform counts to a log2 scale for better visualization
+dt.exp_raw <- stack(as.data.frame(counts))
+dt.exp_raw$values <- log2(dt.exp_raw$values + 1e-3)
+dt.exp_raw$gp <- label_cond(dt.exp_raw$ind)
+colnames(dt.exp_raw) <- c('log2exp','sampleID','colorID')
+```
+
+We plot the variation of raw counts across our samples
+
+```{r fig.width=7, fig.height=4}
+boxplot.expr_raw <- ggplot(dt.exp_raw, aes(x=sampleID, y=log2exp, fill=colorID)) +
+  geom_violin(show.legend = FALSE) +
+  theme_light() +
+  theme(plot.title = element_text(hjust=0.5),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_manual(values=condition.colors) +
+  xlab("Samples") +
+  ylab("log2 raw counts") +
+  ggtitle("Boxplot of raw counts")
+print(boxplot.expr_raw)
+```
+
+```{r, include=FALSE, warning=FALSE}
+#save plot
+png(paste0(imgdir,"raw_counts_boxplot.png"),
+      width=12, height=6, units = c("in"), res = 600)
+print(boxplot.expr_raw)
+dev.off()
+```
+
+It's also important to know the library size differences
+```{r fig.width=7, fig.height=4}
+libsize <- as.data.frame(colSums(counts))
+colnames(libsize) <- "LibSize"
+libsize$sampleID <- as.factor(row.names(libsize))
+libsize$colorID <- label_cond(libsize$sampleID)
+
+
+libsize_plot <- ggplot(libsize, aes(x=sampleID, y=LibSize, fill=colorID)) +
+  geom_bar(stat="identity") +
+  scale_fill_manual(values=condition.colors) +
+  labs(title="Library size by sample") +
+  ylab("Library Size") +
+  xlab("Sample") +
+  coord_flip() + theme_light() +
+  theme(legend.position="none")
+print(libsize_plot)
+```
+
+```{r, include=FALSE, warning=FALSE}
+#save plot
+png(paste0(imgdir,"raw_counts_libsize.png"),
+      width=12, height=6, units = c("in"), res = 600)
+print(libsize_plot)
+dev.off()
+```
+
+# Establishing the assay conditions & Normalitzation
+
+```{r, include=FALSE, warning=FALSE}
+#libraries used to perform DESeq2 analysis
+library(dplyr)
+library(tidyr)
+library(DESeq2)
+library(apeglm)
+library(ggplot2)
+library(ggrepel)
+library(EnhancedVolcano)
+library(edgeR)
+library(limma)
+```
+
+Our first normalization is by peak width. We will divide the counts by the amplitude of the peak
+
+```{r}
+width_values <- peaks_info$width
+names(width_values) <- peaks_info$peak_id
+counts <- sweep(counts, 2, width_values, "/")
+```
+
+From our matrix we create an object called ``dge`` containing information from our counts and sample information.
+```{r}
+dge <- DGEList(counts=counts,
+               samples=samples.info,
+               group=samples.info$condition)
+str(dge)
+```
+
+We most also define the design of our assay. In limma we define a matrix-like design that will indicate which are our hypothesis contrasts. This is one of the key steeps in the limma analysis.
+```{r}
+design.condition   <- model.matrix( ~0+ samples.info$condition, dge )
+colnames(design.condition) <- gsub("samples.info[$]condition", "", colnames(design.condition))
+colnames(design.condition) <- gsub("samples.info[$]sample", "", colnames(design.condition))
+names(attr(design.condition,"contrasts")) <- c("condition")
+rownames(design.condition) <-samples.info$Sample
+design.condition
+```
+
+If the sequencing depth is reasonably consistent across the samples, then the simplest and most robust approach is to use limma-trend. This approach will usually work well if the ratio of the largest library size to the smallest is not more than about 3-fold. We can check this in [Data exploration]. 
+
+```{r}
+print(paste0('The largest library have: ',max(libsize$LibSize),' counts'))
+print(paste0('The smallest library have: ',min(libsize$LibSize),' counts'))
+print(paste0("That's ", round(max(libsize$LibSize)/min(libsize$LibSize),1), " times bigger"))
+```
+
+In the limma-trend, the counts are normalized and converted to logCPM values.
+```{r}
+dge <- calcNormFactors(dge, method="TMM")
+logCPM <- cpm(dge, log=TRUE, prior.count=3)
+```
+
+```{r warning=FALSE, include=FALSE}
+write.table(logCPM,
+            file=paste0(statdir,"normalized_counts_logCPM.tsv"),
+              sep="\t", na="NA", dec=",", col.names=TRUE, row.names=TRUE)
+```
+
+After normalization we can observe the counts distribution varied and also how the normalized libraries are corrected. 
+
+```{r}
+#merge of the logCPM with the sample information. 
+dt.exp <- stack(as.data.frame(logCPM))
+dt.exp$gp <- label_cond(dt.exp$ind)
+colnames(dt.exp) <- c('log2exp','sampleID','colorID')
+```
+
+```{r fig.width=7, fig.height=4}
+boxplot.expr_raw <- ggplot(dt.exp, aes(x=sampleID, y=log2exp, fill=colorID)) +
+  geom_violin(show.legend = FALSE) +
+  theme_light() +
+  theme(plot.title = element_text(hjust=0.5),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_manual(values=condition.colors) +
+  xlab("Samples") +
+  ylab("log2 CPM") +
+  ggtitle("Boxplot of normalized counts")
+print(boxplot.expr_raw)
+```
+
+```{r, include=FALSE, warning=FALSE}
+#save plot
+png(paste0(imgdir,"normalized_counts_boxplot.png"),
+      width=12, height=6, units = c("in"), res = 600)
+print(boxplot.expr_raw)
+dev.off()
+```
+
+It's also important to know the library size differences
+```{r fig.width=7, fig.height=4}
+libsize <- as.data.frame(colSums(logCPM))
+colnames(libsize) <- "LibSize"
+libsize$sampleID <- as.factor(row.names(libsize))
+libsize$colorID <- label_cond(libsize$sampleID)
+
+
+libsize_plot <- ggplot(libsize, aes(x=sampleID, y=LibSize, fill=colorID)) +
+  geom_bar(stat="identity") +
+  scale_fill_manual(values=condition.colors) +
+  labs(title="Library size by sample after normalitzation") +
+  ylab("Library Size") +
+  xlab("Sample") +
+  coord_flip() + theme_light() +
+  theme(legend.position="none")
+print(libsize_plot)
+```
+
+```{r, include=FALSE, warning=FALSE}
+#save plot
+png(paste0(imgdir,"normlaized_counts_libsize.png"),
+      width=12, height=6, units = c("in"), res = 600)
+print(libsize_plot)
+dev.off()
+```
+
+We observe the PCA distribution of our samples
+```{r fig.width=7, fig.height=7}
+pcaData <- prcomp(counts, scale=T)
+pcaData.df <- as.data.frame(pcaData$rotation)
+percentVar <- round(summary(pcaData)$importance[2,]*100,2)
+
+pcaData.df$sampleID <- as.factor(row.names(pcaData.df))
+pcaData.df$colorID <- label_cond(pcaData.df$sampleID)
+
+
+pca.expr_raw <- ggplot(pcaData.df, aes(x=PC1,y=PC2, color=colorID, label=sampleID)) +
+  geom_point(size=3) +
+  scale_color_manual(values=condition.colors) +
+  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar[2],"% variance")) +
+  geom_label_repel(aes(label = sampleID),
+                   box.padding   = 0.35,
+                   point.padding = 0.5,
+                   segment.color = 'grey50') +
+  theme_light() +
+  theme(legend.position="none")
+print(pca.expr_raw)
+```
+
+```{r, include=FALSE, warning=FALSE}
+#save plot
+png(paste0(imgdir,"raw_counts_pca.png"),
+      width=8, height=8, units = c("in"), res = 600)
+print(pca.expr_raw)
+dev.off()
+```
+
+
+We can also see the sample distribution in a dendrogram.
+```{r fig.width=9, fig.height=5}
+dist <- as.dist(1-cor(counts, method="spearman"))
+distclust <- hclust(dist)
+dendrogram <- as.dendrogram(distclust, hang=0.1)
+labels_colors(dendrogram) <- condition.colors[samples.info$condition][order.dendrogram(dendrogram)]
+dend_raw <- function(){plot(dendrogram,
+                 horiz = FALSE,
+                 yaxt='n', ann=FALSE)}
+dend_raw()
+```
+
+```{r, include=FALSE, warning=FALSE}
+#save plot
+png(paste0(imgdir,"raw_counts_dendogram.png"),
+      width=9, height=5, units = c("in"), res = 600)
+dend_raw()
+dev.off()
+```
+
+# limma analysis
+
+Limma is a package for the analysis of gene expression data arising from microarray or RNA-seq technologies. A core capability is the use of linear models to assess differential expression in the context of multi-factor designed experiments. In the limma approach to RNA-seq, read counts are converted to log2-counts-per-million (logCPM) and the mean-variance relationship is modeled either with precision weights or with an empirical Bayes prior trend.
+
+
+```{r, include=FALSE, warning=FALSE}
+#libraries used to perform limma analysis
+library(dplyr)
+library(tidyr)
+library(apeglm)
+library(ggplot2)
+library(ggrepel)
+library(EnhancedVolcano)
+library(tibble)
+```
+
+We fit our data to limma linear model
+```{r}
+contrasts= c(paste("emb4","emb6", sep="-"),
+             paste("emb6","emb8", sep="-"),
+             paste("emb8","emb10", sep="-"),
+             paste("emb10","emb12", sep="-"),
+             paste("emb12","emb14", sep="-"))
+contrasts.matrix <- makeContrasts(contrasts=contrasts, levels=design.condition)
+
+fitt <- lmFit(logCPM, design.condition)
+fitt <- contrasts.fit(fitt, contrasts.matrix)
+fitt <- eBayes(fitt, trend=TRUE)
+summary(decideTests(fitt))
+```
+
+We plot how many new oppened peaks we have per stage. We define as new open the unregulated peaks and new closed the dowregulated peaks.
+
+```{r}
+de_df <- data.frame(t(summary(decideTests(fitt))))
+colnames(de_df) <- c("stg_trans", "exp", "n")
+
+filtered_df <- de_df[de_df$exp != "NotSig", ]
+
+ggplot(filtered_df, aes(x = stg_trans, y = n, color = exp, group = exp)) +
+  geom_line() +
+  geom_point() +
+  labs(title = "Line Plot of n vs stg_trans",
+       x = "Satge transition",
+       y = "Number of differentally regulated peaks",
+       color = "Chromatin state") +
+  scale_color_manual(values = c("Down" = "#67B3E0", "Up" = "#FE938C"),
+                     labels = c("Down" = "Closed", "Up" = "Opened")) +
+  theme_minimal()
+```
+
+```{r}
+make_toptable_arraysonly <- function (thyset,de.efit,expr.raw,thycontrast,
+                                      thylbl="",thyfun="",max.hmp.ROWS=100) {
+  cat("# Running on ",thyset,".limma.",thylbl,thycontrast,"\n",sep="");
+  top.res <- topTable(de.efit, coef=thycontrast, adjust="fdr", sort.by="B", number=Inf)
+  top.res$contig.ID <- rownames(top.res)
+  top.res <- left_join(top.res,annotations_table,by="contig.ID")
+  top.res$rank <- ifelse(is.na(top.res$P.Value) | is.na(top.res$logFC), NA,
+                         # ifelse(is.na(top.res$logFC), -1e160, -1e150 * top.res$logFC),
+                         -log10(top.res$P.Value)*top.res$logFC *
+                           ifelse(top.res$P.Value <= MIN.PV & abs(top.res$logFC) >= MIN.FC,
+                                  ifelse(top.res$adj.P.Val <= MIN.PV, 1e4, 1e2), 1));
+  top.res$DGE.pval <- as.factor(
+    ifelse(top.res$P.Value <= MIN.PV & abs(top.res$logFC) >= MIN.FC,
+           ifelse(top.res$logFC >= MIN.FC, "up", "down"), "no-sig") );
+  top.res$DGE.padj <- as.factor(
+    ifelse(top.res$adj.P.Val <= MIN.PV & abs(top.res$logFC) >= MIN.FC,
+           ifelse(top.res$logFC >= MIN.FC, "UP", "DOWN"), "no-sig") );
+  rownames(top.res) <- top.res$contig.ID
+  contrast.Signif <- c( top.res$DGE.padj == "UP" | top.res$DGE.padj == "DOWN" )
+  contrast.Signif.ids <- top.res$contig.ID[contrast.Signif]
+  contrast.signif <- c( top.res$DGE.pval == "up" | top.res$DGE.pval == "down" )
+  contrast.signif.ids <- top.res$contig.ID[contrast.signif]
+  contrast.Tbl <- cbind(top.res[ contrast.Signif.ids, ],
+                        expr.raw[ contrast.Signif.ids, ])
+  contrast.tbl <- cbind(top.res[ contrast.signif.ids, ],
+                        expr.raw[ contrast.signif.ids, ])
+  cRows <- nrow(contrast.Tbl)
+  crows <- nrow(contrast.tbl)			  
+  cmax.Rows <- min(cRows,max.hmp.ROWS) #100)
+  cmax.rows <- min(crows,max.hmp.ROWS) #100)
+  cat("# Heatmap for ",thyset,".limma.",thylbl,thycontrast,
+      " nrows=",cRows,"/",cmax.Rows," : ",crows,"/",cmax.rows,"\n",sep="");
+  contrast.Tmp <- (contrast.Tbl[with(contrast.Tbl,
+                                     order(abs(contrast.Tbl$rank), # logFC),
+                                           decreasing=TRUE )),]
+  )[1:cmax.Rows,]
+  contrast.tmp <- (contrast.tbl[with(contrast.tbl,
+                                     order(abs(contrast.tbl$rank), # logFC),
+                                           decreasing=TRUE )),]
+  )[1:cmax.rows,]
+  cond.select <- c (sub("_vs_.*", "", thycontrast), sub(".*_vs_", "", thycontrast))
+  barcode.select <- samples.info[samples.info$condition %in% cond.select,]$barcode
+  pHM1 <-pheatmap::pheatmap(contrast.Tmp[, barcode.select],
+                            labels_col = samples.info[samples.info$barcode %in% barcode.select,]$shrtlbl,
+                            labels_row = contrast.Tmp[, "contig.ID"],
+                            angle_col=45,
+                            main = paste0("Most varying ",cmax.Rows," of ",cRows," significant markers\nfor ",
+                                          thyset,".limma.",thylbl,thycontrast," (",thyfun,")"))
+  png(file=paste0(imgdir,"limma_heatmaps_",thyfun,"expression_significantgenesonly.",thyset,".limma.",thylbl,".",thycontrast,".png"),
+      res=600, height=max(4,(20 * cmax.Rows/100)), width=10, unit="in", pointsize=10);
+  grid::grid.newpage()
+  grid::grid.draw(pHM1$gtable)
+  dev.off();
+  
+  pHM2 <- pheatmap::pheatmap(contrast.Tmp[, barcode.select],
+                             labels_col = samples.info[samples.info$barcode %in% barcode.select,]$shrtlbl,
+                             labels_row = contrast.Tmp[, "Human.homolog"],
+                             angle_col=45,
+                             main = paste0("Most varying ",cmax.Rows," of ",cRows," significant markers\nfor ",
+                                           thyset,".limma.",thylbl,thycontrast," (",thyfun,")"))
+  png(file=paste0(imgdir,"limma_heatmaps_with_homologs_",thyfun,"expression_significantgenesonly.",thyset,".limma.",thylbl,".",thycontrast,".png"),
+      res=600, height=max(4,(20 * cmax.Rows/100)), width=10, unit="in", pointsize=10);
+  grid::grid.newpage()
+  grid::grid.draw(pHM2$gtable)
+  dev.off();
+  
+  phm1 <- pheatmap::pheatmap(contrast.tmp[, barcode.select],
+                             labels_col = samples.info[samples.info$barcode %in% barcode.select,]$shrtlbl,
+                             labels_row = contrast.tmp[, "contig.ID"],
+                             angle_col=45,
+                             main = paste0("Most varying ",cmax.rows," of ",cRows," markers\n for ",
+                                           thyset,".limma.",thylbl,thycontrast," (",thyfun,")"))
+  png(file=paste0(imgdir,"limma_heatmaps_",thyfun,"expression_topmostvaryinggenes.",thyset,".limma.",thylbl,".",thycontrast,".png"),
+      res=600, height=max(4,(20 * cmax.rows/100)), width=10, unit="in", pointsize=10);
+  grid::grid.newpage()
+  grid::grid.draw(phm1$gtable)
+  dev.off();
+  
+  phm2 <-pheatmap::pheatmap(contrast.tmp[, barcode.select],
+                            labels_col = samples.info[samples.info$barcode %in% barcode.select,]$shrtlbl,
+                            labels_row = contrast.tmp[, "Human.homolog"],
+                            angle_col=45,
+                            main = paste0("Most varying ",cmax.rows," of ",cRows," markers\n for ",
+                                          thyset,".limma.",thylbl,thycontrast," (",thyfun,")"))
+  png(file=paste0(imgdir,"limma_heatmaps_with_homologs_",thyfun,"expression_topmostvaryinggenes.",thyset,".limma.",thylbl,".",thycontrast,".png"),
+      res=600, height=max(4,(20 * cmax.rows/100)), width=10, unit="in", pointsize=10);
+  grid::grid.newpage()
+  grid::grid.draw(phm2$gtable)
+  dev.off();
+
+}
+```
+
+
+We generate a table with the results:
+
+```{r}
+make_top_table <- function(fit_model, contrast) {
+  top.res.t <- topTable(fit_model, coef=contrast, 
+                     adjust.method = "fdr", sort.by="B",
+                     number=Inf)
+  top.res.t$rank <- ifelse(is.na(top.res.t$P.Value) | is.na(top.res.t$logFC), NA,
+                         -log10(top.res.t$P.Value)*top.res.t$logFC *
+                           ifelse(top.res.t$P.Value <= MIN.PV,
+                                  ifelse(top.res.t$adj.P.Val <= MIN.PV, 1e4, 1e2), 1));
+  top.res.t$DGE.pval <- as.factor(
+    ifelse(top.res.t$P.Value <= MIN.PV,
+           ifelse(top.res.t$logFC >= MIN.FC, "up", "down"), "no-sig") );
+  top.res.t$DGE.padj <- as.factor(
+    ifelse(top.res.t$adj.P.Val <= MIN.PV,
+           ifelse(top.res.t$logFC >= MIN.FC, "UP", "DOWN"), "no-sig") );
+  
+  UPDN <- c(nrow(top.res.t[ top.res.t$DGE.padj == "UP", ]),
+            nrow(top.res.t[ top.res.t$DGE.padj == "DOWN", ]))
+  updn <- c(nrow(top.res.t[ top.res.t$DGE.pval == "up", ]),
+            nrow(top.res.t[ top.res.t$DGE.pval == "down", ]))
+  
+  top.res.t
+}
+
+top_table_list <- lapply(contrasts, 
+                         function(x) make_top_table(fitt, x))
+names(top_table_list) <- contrasts
+```
+
+We add the gene anotation information to the table
+
+```{r}
+top_table_list_annot <- lapply(contrasts,
+                               function(x) {
+                                 df = tibble::rownames_to_column(top_table_list[[x]], "peak_id")
+                                 merge(df, peaks_annot, by.x="peak_id")
+                               })
+names(top_table_list_annot) <- contrasts
+```
+
+```{r warning=FALSE, include=FALSE}
+lapply(1:length(top_table_list_annot),
+       function(i) {
+         top.res.sig <- subset(top_table_list_annot[[i]], DGE.padj != "no-sig")
+         write.table(top.res.sig,
+                     file=paste0(statdir,"limma_",names(top_table_list_annot)[[i]],"_diffexp_peaks.tsv",sep=""),
+                     sep="\t", na="NA", dec=",", col.names=TRUE, row.names=TRUE)
+         })
+```
+
+We plot the results in a Volcano plot:
+
+```{r}
+my_volcanoplot <- function(top.res.table, contrast_name) {
+  #define some values for the caption
+  UPDN <- c(nrow(top.res.table[ top.res.table$DGE.padj == "UP", ]),
+            nrow(top.res.table[ top.res.table$DGE.padj == "DOWN", ]))
+  
+  EnhancedVolcano(data.frame(top.res.table), x = 'logFC', y = 'adj.P.Val',
+                  lab = rownames(top.res.table),
+                  xlab = bquote(~Log[2]~ 'fold change'),
+                  ylab = bquote(~-Log[10]~adjusted~italic(P)),
+                  xlim = c(min(top.res.table$logFC, na.rm = TRUE) - 0.5, max(top.res.table$logFC, na.rm = TRUE) + 0.5),
+                  ylim = c(0, max(-log10(top.res.table$adj.P.Val), na.rm = TRUE) + 1),
+                  pCutoff = MIN.PV, FCcutoff = MIN.FC, pointSize = 1.0, labSize = 2.0,
+                  title = "Volcano Plot",
+                  subtitle = contrast_name,
+                  caption = paste0('log2 FC cutoff: ', MIN.FC, '; p-value cutoff: ',
+                                   MIN.PV, '\nTotal = ', nrow(top.res.table),
+                                   ' markers  [ ',UPDN[1],'UP, ',UPDN[2],'DOWN ]'),
+                  legendPosition = 'bottom', legendLabSize = 14, legendIconSize = 5.0,
+                  drawConnectors = TRUE, widthConnectors = 0.25,
+                  colConnectors = 'grey30')}
+```
+
+```{r fig.width=7, fig.height=7, warning=FALSE}
+volcano_plot_list <- lapply(1:length(top_table_list),
+       function(i) {
+         my_volcanoplot(top.res.table=top_table_list[[i]],
+                        contrast_name=names(top_table_list)[[i]])
+       })
+
+print(volcano_plot_list)
+```
+
+```{r warning=FALSE, include=FALSE}
+#save plot
+names(volcano_plot_list) <- contrasts
+lapply(1:length(volcano_plot_list),
+       function(i) {
+         png(paste0(imgdir,"volcanoplot_",names(volcano_plot_list)[[i]],".png"),
+             width=9, height=9, units = c("in"), res = 600)
+         print(volcano_plot_list[[i]])
+         dev.off()
+       })
+```
+
+# MFFuzz
+
+```{r}
+library("Mfuzz")
+library("Biobase")
+library("stringr")
+```
+
+We are going to use the normalized counts in CPMs saved as `logCPM` (see Normalitzation secction). We collapse the biological replicates to do this experiment because we normalized them and we have seen that they are not too different.
+
+```{r}
+logCPM_collapsed <- matrix(0, nrow = nrow(logCPM), ncol = length(levels(condition_factors)))
+colnames(logCPM_collapsed) <- levels(condition_factors)
+rownames(logCPM_collapsed) <- rownames(logCPM)
+for (i in 1:length(levels(condition_factors))) {
+  names_before_underscore <- str_extract(colnames(logCPM), "^[^_]+")
+  unique_names <- unique(names_before_underscore)
+  cols_to_sum <- startsWith(names_before_underscore, unique_names[i])
+  logCPM_collapsed[, i] <- rowSums(logCPM[, cols_to_sum])
+}
+```
+
+We save the data in a new object using `ExpressionSet`
+
+```{r}
+normalizedSet <- ExpressionSet(assayData=logCPM_collapsed)
+```
+
+We filter any possible NA values. We also standardize the expression values of every peak so that the average expression value for each peak is zero and the standard deviation of its expression profile is one
+```{r}
+embryo.r <- filter.NA(normalizedSet, thres=0.5)
+embryo.f <- fill.NA(embryo.r,mode="knnw")
+embryo.s <- standardise(embryo.f)
+```
+
+We optimize the parameters for the MFuzz analysis. we will use two parameters:
+- fuzzifier value (m): We will determine the optimal setting of fuzzifie value using `mestimate`. This will be only an estimation since the final result tuned depending on the performance of the function. 
+- number of clusters: final number of clusters. This will be determined using repeated soft clustering for a range of cluster numbers. This will report the minimum centroid distance. The minimum centroid distance can be used as cluster validity index. For an optimal cluster number, we may see a ‘drop’ of minimum centroid distance wh plotted versus a range of cluster number and a slower decrease of the minimum centroid distance for higher cluster number.
+
+```{r, cache=TRUE}
+m_est <- mestimate(embryo.s)
+m_est
+m=1.5
+
+plot_opt_cluster  <- Dmin(embryo.f,m=m,crange=seq(5,40,5),repeats=30,visu=TRUE)
+print(plot_opt_cluster)
+```
+
+```{r warning=FALSE, include=FALSE}
+png(paste0(imgdir,"optim_nclust.png"),
+             width=9, height=9, units = c("in"), res = 600)
+plot_opt_cluster
+dev.off()
+```
+
+We define the final parameters for the Mfuzz analysis
+```{r}
+m=1.5
+cluster=35
+```
+
+
+```{r}
+mf <- mfuzz(embryo.s,c=cluster,m=m)
+mfuzz.plot(embryo.s,cl=mf, time.labels=c("emb4","emb6","emb8","emb10","emb12","emb14"),new.window=FALSE)
+```
+
+```{r warning=FALSE, include=FALSE}
+pdf(paste0(imgdir,"mfuzz_cl35_m1.pdf"), height=10, width=10)
+mfuzz.plot(embryo.s,cl=mf, time.labels=c("emb4","emb6","emb8","emb10","emb12","emb14"),new.window=FALSE)
+dev.off()
+```
+
+The results are stored in the `mf` object. Some interesting metrics are:
+- centers:	the final cluster centers.
+- size: the number of data points in each cluster of the closest hard clustering.
+- cluster: a vector of integers containing the indices of the clusters where the data points are assigned to for the closest hard clustering, as obtained by assigning points to the (first) class with maximal membership.
+- membership: a matrix with the membership values of the data points to the clusters.
+
+```{r warning=FALSE, include=FALSE}
+write.table( mf$centers, file=paste0(statdir,"Center_mfuzz.txt"), sep="\t")
+write.table( mf$membership, file=paste0(statdir,"Membership_mfuzz.txt"), sep="\t")
+write.table( mf$size, file=paste0(statdir,"Size_mfuzz.txt"), sep="\t")
+write.table( mf$cluster, file=paste0(statdir,"Cluster_mfuzz.txt"), sep="\t")
+```
+
+We will make a data frame with the cluster assigned to each peak and add the annotation information. This will be useful for downstream analysis like GO or pathway enrichment.
+
+```{r}
+mf_clusters <- data.frame(peak=names(mf$cluster), clusters = as.numeric(mf$cluster))
+colnames(mf_clusters) <- c("peak_id", "cluster")
+mf_clusters_annot <- merge(mf_clusters, peaks_annot, by.x="peak_id")
+```
+```{r warning=FALSE, include=FALSE}
+write.table(mf_clusters_annot, file=paste0(statdir,"Cluster_mfuzz_annot.txt"), sep="\t")
+```
+
+
